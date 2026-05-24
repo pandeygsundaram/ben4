@@ -5,7 +5,7 @@ import { Caption } from "./transcribe";
 import { RenderConfig } from "./engine";
 
 // Starter template — never modified, stays pristine
-const TEMPLATE_DIR = "/home/sundaram/data/ai-powered-video-editor";
+const TEMPLATE_DIR = path.join(__dirname, "../../template");
 const OUTPUT_DIR = "/home/sundaram/data/reel-server/output";
 
 export type ClipInput = {
