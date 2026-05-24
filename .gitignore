@@ -6,3 +6,4 @@ music/
 projects/*/remotion/
 template/node_modules/
 template/whisper.cpp/
+projects/*

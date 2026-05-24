@@ -72,6 +72,9 @@ async function callRumicTTS(
     };
   }
 
+  console.log(`[voiceover] → POST ${RUMIC_BASE}/v1/tts`);
+  console.log(`[voiceover] body:`, JSON.stringify(body));
+
   const response = await fetch(`${RUMIC_BASE}/v1/tts`, {
     method: "POST",
     headers: {
@@ -81,12 +84,16 @@ async function callRumicTTS(
     body: JSON.stringify(body),
   });
 
+  console.log(`[voiceover] response status: ${response.status} ${response.statusText}`);
+
   if (!response.ok) {
     const err = await response.json().catch(() => ({ error: response.statusText }));
+    console.error(`[voiceover] error body:`, err);
     throw new Error(`Rumic AI TTS error ${response.status}: ${(err as any).error ?? "unknown"}`);
   }
 
   const buffer = await response.arrayBuffer();
+  console.log(`[voiceover] ✓ received ${(buffer.byteLength / 1024).toFixed(0)} KB WAV`);
   return Buffer.from(buffer);
 }
 

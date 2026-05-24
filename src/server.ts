@@ -9,12 +9,28 @@ import { transcribeVideo } from "./transcribe";
 import { createJob, getJob, updateJob, loadJobsFromDisk, PROJECTS_DIR } from "./jobs";
 import { renderVideo } from "./render";
 import { createSession, getSession, appendMessage } from "./session";
-import { chat, generateRenderConfig } from "./engine";
+import { chat, generateRenderConfig, generateMotivationalScript } from "./engine";
 import { generateVoiceover } from "./voiceover";
+import {
+  handleTelegramUpdate,
+  notifyJobDone,
+  notifyJobError,
+  telegramJobChatMap,
+  setWebhook,
+  isAuthorized,
+  getStatus as getTelegramStatus,
+  TelegramUpdate,
+} from "./integrations/telegram";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Log every incoming request
+app.use((req, _res, next) => {
+  console.log(`[http] ${req.method} ${req.path}`);
+  next();
+});
 
 const upload = multer({ dest: "/tmp/reel-uploads/" });
 
@@ -167,6 +183,54 @@ app.get("/project/:id/download", (req, res) => {
   res.download(job.outputPath, `reel-${req.params.id}.mp4`);
 });
 
+// ─── Telegram endpoints ────────────────────────────────────────────────────────
+
+// GET /telegram/status — check if bot token is configured
+app.get("/telegram/status", (_req, res) => {
+  res.json(getTelegramStatus());
+});
+
+// POST /telegram/set-webhook — register the Telegram webhook (call once after ngrok starts)
+// Body: { "url": "https://xxxx.ngrok-free.app" }
+app.post("/telegram/set-webhook", async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url) { res.status(400).json({ error: "url required" }); return; }
+    await setWebhook(url);
+    res.json({ ok: true, url });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /telegram/webhook/:secret? — receives updates from Telegram
+app.post("/telegram/webhook/:secret?", async (req, res) => {
+  if (!isAuthorized(req.params.secret)) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  res.sendStatus(200); // ack Telegram immediately
+
+  const update = req.body as TelegramUpdate;
+  handleTelegramUpdate(update, (jobId, sessionId, videoPath, description) => {
+    // Build a one-clip job from the downloaded Telegram video
+    const jobDir = path.join(PROJECTS_DIR, jobId);
+    fs.mkdirp(jobDir).then(async () => {
+      // Move the temp file into the job dir so it survives cleanup
+      const dest = path.join(jobDir, "clip_0.mp4");
+      await fs.move(videoPath, dest, { overwrite: true });
+      const clips = [{ videoPath: dest, description }];
+      await fs.writeJson(
+        path.join(jobDir, "job.json"),
+        { jobId, status: "pending", clips, sessionId, createdAt: Date.now() },
+        { spaces: 2 }
+      );
+      createJob(jobId, clips, jobDir);
+      processJob(jobId, sessionId).catch(console.error);
+    }).catch(console.error);
+  }).catch(console.error);
+});
+
 // POST /voice — raw audio blob (Phase 4: WhatsApp voice notes)
 app.post("/voice", upload.single("audio"), async (req, res) => {
   try {
@@ -188,13 +252,16 @@ async function processJob(jobId: string, sessionId?: string, musicId?: string, s
   const jobDir = path.join(PROJECTS_DIR, jobId);
 
   try {
-    // Step 1: Transcribe all clips
+    // ── Step 1: Transcribe ──────────────────────────────────────────────────
+    console.log(`\n[job:${jobId}] ━━ STEP 1: TRANSCRIBE (${job.clips.length} clips) ━━`);
     updateJob(jobId, { status: "transcribing" });
     await persistJobStatus(jobId, "transcribing", jobDir);
 
-    for (const clip of job.clips) {
-      console.log(`[job:${jobId}] transcribing ${path.basename(clip.videoPath)}`);
+    for (let i = 0; i < job.clips.length; i++) {
+      const clip = job.clips[i];
+      console.log(`[job:${jobId}] transcribing clip ${i + 1}/${job.clips.length}: ${path.basename(clip.videoPath)}`);
       clip.captions = await transcribeVideo(clip.videoPath);
+      console.log(`[job:${jobId}] clip ${i + 1} → ${clip.captions.length} words`);
     }
 
     await fs.writeJson(
@@ -202,49 +269,106 @@ async function processJob(jobId: string, sessionId?: string, musicId?: string, s
       job.clips.map((c) => ({ videoPath: c.videoPath, captions: c.captions })),
       { spaces: 2 }
     );
+    console.log(`[job:${jobId}] transcripts saved`);
 
-    // Step 2: Generate RenderConfig via Gemini if session exists
+    // ── Step 2: Gemini RenderConfig ─────────────────────────────────────────
+    console.log(`\n[job:${jobId}] ━━ STEP 2: GEMINI RENDER CONFIG ━━`);
     updateJob(jobId, { status: "rendering" });
     await persistJobStatus(jobId, "rendering", jobDir);
 
     const allCaptions = job.clips.flatMap((c) => c.captions ?? []);
     const transcript = allCaptions.map((c) => c.text).join(" ");
-    const totalDurationMs = allCaptions.length
-      ? allCaptions[allCaptions.length - 1].endMs
-      : 0;
+    const totalDurationMs = allCaptions.length ? allCaptions[allCaptions.length - 1].endMs : 0;
+    console.log(`[job:${jobId}] total captions: ${allCaptions.length}, duration: ${(totalDurationMs / 1000).toFixed(1)}s`);
+    console.log(`[job:${jobId}] transcript preview: "${transcript.slice(0, 120)}..."`);
 
     const session = sessionId ? getSession(sessionId) : undefined;
     let renderConfig = null;
 
     if (session) {
-      console.log(`[job:${jobId}] generating RenderConfig via Gemini`);
+      console.log(`[job:${jobId}] session context:`, JSON.stringify(session.context));
+      console.log(`[job:${jobId}] → calling Gemini to generate RenderConfig`);
       renderConfig = await generateRenderConfig(session, transcript, allCaptions, totalDurationMs);
+      console.log(`[job:${jobId}] ✓ RenderConfig: type=${renderConfig.videoType}, events=${renderConfig.events.length}`);
+    } else {
+      console.log(`[job:${jobId}] no session — skipping Gemini, using default style`);
     }
 
-    // Resolve music path if musicId provided
     let musicSrc: string | undefined;
     if (musicId) {
+      console.log(`[job:${jobId}] looking for music: ${musicId}`);
       const musicFiles = await fs.readdir(MUSIC_DIR).catch(() => [] as string[]);
       const musicFile = musicFiles.find((f) => f.startsWith(musicId));
-      if (musicFile) musicSrc = path.join(MUSIC_DIR, musicFile);
+      if (musicFile) {
+        musicSrc = path.join(MUSIC_DIR, musicFile);
+        console.log(`[job:${jobId}] ✓ music found: ${musicSrc}`);
+      } else {
+        console.warn(`[job:${jobId}] music file not found for id: ${musicId}`);
+      }
     }
     if (renderConfig && musicSrc) renderConfig.musicSrc = musicSrc;
 
-    // Step 3: generate Rumic AI voiceover if a script was provided
+    // ── Step 3: Rumic AI Voiceover (optional / motivational mode) ─────────────
     let voiceoverPath: string | undefined;
-    if (script?.trim()) {
-      console.log(`[job:${jobId}] generating Rumic AI voiceover`);
-      const videoType = session?.context.videoType ?? "founder";
-      const energyLevel = session?.context.energyLevel ?? "medium";
+
+    // Detect motivational mode: check session history, clip descriptions, or explicit script
+    const allSessionText = session
+      ? session.history.map((m) => m.text).join(" ").toLowerCase()
+      : "";
+    const allDescriptions = job.clips.map((c) => (c.description ?? "")).join(" ").toLowerCase();
+    const isMotivational =
+      allSessionText.includes("motivational") ||
+      allDescriptions.includes("motivational") ||
+      (script?.toLowerCase().includes("motivational") ?? false);
+
+    console.log(`[job:${jobId}] motivational=${isMotivational} (session="${allSessionText.slice(0, 60)}" desc="${allDescriptions.slice(0, 60)}"`);
+
+    let effectiveScript = script?.trim();
+
+    if (isMotivational && !effectiveScript) {
+      console.log(`\n[job:${jobId}] ━━ STEP 3a: GENERATING MOTIVATIONAL SCRIPT ━━`);
+      effectiveScript = await generateMotivationalScript(transcript, totalDurationMs);
+      console.log(`[job:${jobId}] motivational script: "${effectiveScript.slice(0, 120)}..."`);
+      const motivationalStyle = {
+        fontPreset: "bold" as const,
+        highlightColor: "#FF6B35",
+        captionSize: 110,
+        animationSpeed: "fast" as const,
+        captionPosition: "bottom" as const,
+      };
+      if (renderConfig) {
+        renderConfig.style = motivationalStyle;
+        renderConfig.videoType = "emotional";
+      } else {
+        // No session — build a minimal renderConfig for motivational mode
+        renderConfig = {
+          videoType: "emotional" as const,
+          style: motivationalStyle,
+          events: [],
+          captions: allCaptions,
+        };
+      }
+    }
+
+    if (effectiveScript) {
+      console.log(`\n[job:${jobId}] ━━ STEP 3: RUMIC AI VOICEOVER ━━`);
+      console.log(`[job:${jobId}] script (${effectiveScript.length} chars): "${effectiveScript.slice(0, 100)}..."`);
+      const videoType = isMotivational ? "emotional" : (session?.context.videoType ?? "founder");
+      const energyLevel = isMotivational ? "high" : (session?.context.energyLevel ?? "medium");
       const voiceOutputPath = path.join(jobDir, "voiceover.wav");
-      const result = await generateVoiceover(script, videoType, energyLevel, voiceOutputPath);
+      const result = await generateVoiceover(effectiveScript, videoType, energyLevel, voiceOutputPath);
       voiceoverPath = result.audioPath;
-      // Use voiceover captions instead of transcribed video captions
+      console.log(`[job:${jobId}] ✓ voiceover at ${voiceoverPath}`);
       if (renderConfig) renderConfig.captions = result.captions;
+    } else {
+      console.log(`[job:${jobId}] no script — skipping voiceover`);
     }
 
     await fs.writeJson(path.join(jobDir, "render-config.json"), renderConfig ?? { captions: allCaptions }, { spaces: 2 });
+    console.log(`[job:${jobId}] render-config.json saved`);
 
+    // ── Step 4: Render ──────────────────────────────────────────────────────
+    console.log(`\n[job:${jobId}] ━━ STEP 4: REMOTION RENDER ━━`);
     const clipsForRender = job.clips.map((c) => ({
       videoPath: c.videoPath,
       captions: c.captions ?? [],
@@ -252,13 +376,21 @@ async function processJob(jobId: string, sessionId?: string, musicId?: string, s
 
     const outputPath = await renderVideo(jobId, jobDir, clipsForRender, renderConfig ?? undefined, voiceoverPath);
 
-    console.log(`[job:${jobId}] done → ${outputPath}`);
+    console.log(`\n[job:${jobId}] ✅ DONE → ${outputPath}`);
     updateJob(jobId, { status: "done", outputPath });
     await persistJobStatus(jobId, "done", jobDir, outputPath);
+
+    // Notify Telegram if this job came from the bot
+    const tgChatId = telegramJobChatMap.get(jobId);
+    if (tgChatId) notifyJobDone(tgChatId, jobId, outputPath).catch(console.error);
   } catch (err: any) {
-    console.error(`[job:${jobId}] error:`, err.message);
+    console.error(`\n[job:${jobId}] ❌ ERROR:`, err.message);
+    console.error(err.stack);
     updateJob(jobId, { status: "error", error: err.message });
     await persistJobStatus(jobId, "error", jobDir, undefined, err.message);
+
+    const tgChatId = telegramJobChatMap.get(jobId);
+    if (tgChatId) notifyJobError(tgChatId, jobId, err.message).catch(console.error);
   }
 }
 

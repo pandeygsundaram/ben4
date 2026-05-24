@@ -93,7 +93,7 @@ export const CaptionedVideo: React.FC<CaptionedVideoProps> = ({
       {/* Video track — muted when Rumic AI voiceover is present */}
       <AbsoluteFill>
         <OffthreadVideo
-          style={{ objectFit: "cover" }}
+          style={{ objectFit: "cover", width: "100%", height: "100%", display: "block" }}
           src={src}
           muted={Boolean(voiceSrc)}
         />

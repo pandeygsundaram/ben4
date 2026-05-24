@@ -5,7 +5,7 @@ export type VideoType = "founder" | "educational" | "emotional" | "comedy";
 // Context Gemini collects from the conversation before generating
 export type VideoContext = {
   videoType?: VideoType;
-  coreMesage?: string;
+  coreMessage?: string;
   targetAudience?: string;
   energyLevel?: "low" | "medium" | "high";
   musicPreference?: string; // "upbeat", "ambient", "dramatic", "none"

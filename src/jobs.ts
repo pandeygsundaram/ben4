@@ -24,6 +24,7 @@ export type Job = {
 const jobs = new Map<string, Job>();
 
 export function createJob(id: string, clips: Clip[], projectPath: string): Job {
+  console.log(`[jobs] createJob ${id} — ${clips.length} clip(s)`);
   const job: Job = { id, status: "pending", clips, projectPath, createdAt: Date.now() };
   jobs.set(id, job);
   return job;
@@ -35,13 +36,21 @@ export function getJob(id: string): Job | undefined {
 
 export function updateJob(id: string, patch: Partial<Job>): void {
   const job = jobs.get(id);
-  if (job) jobs.set(id, { ...job, ...patch });
+  if (job) {
+    const updated = { ...job, ...patch };
+    jobs.set(id, updated);
+    console.log(`[jobs] ${id} → status: ${updated.status}${updated.error ? ` error: ${updated.error}` : ""}`);
+  }
 }
 
 export async function loadJobsFromDisk(): Promise<void> {
-  if (!await fs.pathExists(PROJECTS_DIR)) return;
+  if (!await fs.pathExists(PROJECTS_DIR)) {
+    console.log(`[jobs] projects dir not found, starting fresh`);
+    return;
+  }
 
   const entries = await fs.readdir(PROJECTS_DIR);
+  console.log(`[jobs] scanning ${entries.length} entries in ${PROJECTS_DIR}`);
 
   for (const entry of entries) {
     const jobFile = path.join(PROJECTS_DIR, entry, "job.json");
@@ -59,8 +68,9 @@ export async function loadJobsFromDisk(): Promise<void> {
         createdAt: data.createdAt ?? 0,
       };
       jobs.set(job.id, job);
-    } catch {
-      console.warn(`[jobs] could not load ${jobFile}`);
+      console.log(`[jobs] loaded ${job.id} (${job.status})`);
+    } catch (e: any) {
+      console.warn(`[jobs] could not load ${jobFile}:`, e.message);
     }
   }
 

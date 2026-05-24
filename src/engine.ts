@@ -1,36 +1,15 @@
-import {
-  GoogleGenerativeAI,
-  GenerativeModel,
-  HarmCategory,
-  HarmBlockThreshold,
-} from "@google/generative-ai";
+import Anthropic from "@anthropic-ai/sdk";
 import { Session, VideoContext, VideoType, appendMessage, updateSession } from "./session";
 import { Caption } from "./transcribe";
 
-const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-
-// Flash for conversation — fast, low cost per turn
-const flashModel = genai.getGenerativeModel({
-  model: "gemini-2.0-flash",
-  safetySettings: [
-    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-  ],
-});
-
-// Pro for RenderConfig generation — runs once per job, quality matters
-const proModel = genai.getGenerativeModel({
-  model: "gemini-2.5-pro",
-  safetySettings: [
-    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-  ],
-});
+const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type StyleConfig = {
   fontPreset: "bold" | "clean" | "condensed" | "playful";
-  highlightColor: string;    // single accent color, no gradients
-  captionSize: number;       // px
+  highlightColor: string;
+  captionSize: number;
   animationSpeed: "fast" | "medium" | "slow";
   captionPosition: "bottom" | "center";
 };
@@ -45,13 +24,12 @@ export type TimelineEvent = {
 export type RenderConfig = {
   videoType: VideoType;
   style: StyleConfig;
-  events: TimelineEvent[];   // what fires every ~3 seconds
+  events: TimelineEvent[];
   captions: Caption[];
   musicSrc?: string;
 };
 
-// ─── Style presets per video type ─────────────────────────────────────────────
-// Clean, no gradients, no emoji spam — typography-first
+// ─── Style presets ─────────────────────────────────────────────────────────────
 
 const STYLE_PRESETS: Record<VideoType, StyleConfig> = {
   founder: {
@@ -84,7 +62,7 @@ const STYLE_PRESETS: Record<VideoType, StyleConfig> = {
   },
 };
 
-// ─── Conversation ─────────────────────────────────────────────────────────────
+// ─── Conversation (Claude) ────────────────────────────────────────────────────
 
 const CONVERSATION_SYSTEM = `You are the intake agent for an AI video editor called Rumic.
 Your job is to collect enough information from the user to edit their video reel.
@@ -100,12 +78,13 @@ Rules:
 - Ask one or two questions at a time, not all at once
 - Be concise — this is a messaging interface, not a form
 - Once you have enough context (at minimum: type + core message), set ready=true in your response
-- Always respond with valid JSON in this shape:
+- Always respond with valid JSON in this exact shape:
   { "message": "your reply to the user", "context": { ...extracted fields... }, "ready": false }
 - Context fields: videoType, coreMessage, targetAudience, energyLevel, musicPreference, additionalNotes
 - videoType must be one of: founder, educational, emotional, comedy
 - energyLevel must be one of: low, medium, high
-- Only set ready=true when you have videoType and coreMessage at minimum`;
+- Only set ready=true when you have videoType and coreMessage at minimum
+- Respond with raw JSON only — no markdown fences, no explanation`;
 
 export async function chat(
   session: Session,
@@ -113,36 +92,30 @@ export async function chat(
 ): Promise<{ reply: string; context: VideoContext; ready: boolean }> {
   appendMessage(session.id, { role: "user", text: userText });
 
-  // Build history for Gemini multi-turn
-  const history = session.history.slice(0, -1).map((m) => ({
-    role: m.role,
-    parts: [{ text: m.text }],
+  const messages: Anthropic.MessageParam[] = session.history.map((m) => ({
+    role: m.role === "model" ? "assistant" : "user",
+    content: m.text,
   }));
 
-  const geminiChat = flashModel.startChat({
-    history: [
-      { role: "user", parts: [{ text: CONVERSATION_SYSTEM }] },
-      { role: "model", parts: [{ text: '{"message":"Understood. Ready to collect video context.","context":{},"ready":false}' }] },
-      ...history,
-    ],
+  const result = await claude.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 512,
+    system: CONVERSATION_SYSTEM,
+    messages,
   });
 
-  const result = await geminiChat.sendMessage(userText);
-  const raw = result.response.text().trim();
+  const raw = (result.content[0] as Anthropic.TextBlock).text.trim();
 
   let parsed: { message: string; context: VideoContext; ready: boolean };
   try {
-    // Strip markdown code fences if Gemini wraps it
     const json = raw.replace(/^```json\n?/, "").replace(/\n?```$/, "");
     parsed = JSON.parse(json);
   } catch {
-    // Fallback if Gemini doesn't return clean JSON
     parsed = { message: raw, context: {}, ready: false };
   }
 
   appendMessage(session.id, { role: "model", text: parsed.message });
 
-  // Merge extracted context into session
   const mergedContext = { ...session.context, ...parsed.context };
   updateSession(session.id, { context: mergedContext, ready: parsed.ready });
 
@@ -163,7 +136,7 @@ export async function generateRenderConfig(
   const prompt = `You are a video editor AI. Generate a timeline of engagement events for this reel.
 
 VIDEO TYPE: ${videoType}
-CORE MESSAGE: ${session.context.coreMesage ?? "not specified"}
+CORE MESSAGE: ${session.context.coreMessage ?? "not specified"}
 ENERGY LEVEL: ${session.context.energyLevel ?? "medium"}
 TOTAL DURATION: ${Math.round(totalDurationMs / 1000)} seconds
 
@@ -180,11 +153,16 @@ Rules for events:
 - NO gradients, NO emoji in text, clean text only
 - durationMs is how long the card stays visible (1500–3000ms)
 
-Respond with ONLY a valid JSON array of events, no explanation:
+Respond with ONLY a valid JSON array of events, no explanation, no markdown:
 [{ "atMs": 0, "durationMs": 2500, "type": "hook", "text": "..." }, ...]`;
 
-  const result = await proModel.generateContent(prompt);
-  const raw = result.response.text().trim();
+  const result = await claude.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 1024,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const raw = (result.content[0] as Anthropic.TextBlock).text.trim();
 
   let events: TimelineEvent[] = [];
   try {
@@ -195,4 +173,30 @@ Respond with ONLY a valid JSON array of events, no explanation:
   }
 
   return { videoType, style, events, captions };
+}
+
+// ─── Motivational script generator ───────────────────────────────────────────
+
+export async function generateMotivationalScript(
+  transcript: string,
+  totalDurationMs: number
+): Promise<string> {
+  const targetWords = Math.round((totalDurationMs / 1000) * 2.5);
+  const prompt = `You are a motivational content writer. Below is a raw transcript from a video.
+Write a short, punchy motivational voiceover script that fits the theme of the original content.
+The script should be ${targetWords} words max (to match ~${Math.round(totalDurationMs / 1000)} seconds of audio).
+Use short sentences. High energy. Direct. No filler. No hashtags. No emoji.
+
+ORIGINAL TRANSCRIPT:
+${transcript}
+
+Respond with ONLY the script text — no labels, no explanations.`;
+
+  const result = await claude.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 512,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  return (result.content[0] as Anthropic.TextBlock).text.trim();
 }

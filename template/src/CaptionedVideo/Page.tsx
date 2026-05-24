@@ -2,7 +2,7 @@ import { makeTransform, scale, translateY } from "@remotion/animation-utils";
 import { TikTokPage } from "@remotion/captions";
 import { fitText } from "@remotion/layout-utils";
 import React from "react";
-import { AbsoluteFill, interpolate, useCurrentFrame, useVideoConfig } from "remotion";
+import { interpolate, useCurrentFrame, useVideoConfig } from "remotion";
 import { TheBoldFont } from "../load-font";
 import { StyleConfig } from "../schema";
 
@@ -39,16 +39,22 @@ export const Page: React.FC<{
 
   const fontSize = Math.min(style.captionSize, fittedText.fontSize);
 
-  const containerStyle: React.CSSProperties = {
-    justifyContent: "center",
-    alignItems: style.captionPosition === "center" ? "center" : "flex-end",
-    top: undefined,
-    bottom: style.captionPosition === "center" ? undefined : 350,
-    height: style.captionPosition === "center" ? undefined : 150,
-  };
+  const containerStyle: React.CSSProperties =
+    style.captionPosition === "center"
+      ? {
+          position: "absolute",
+          top: 0, bottom: 0, left: 0, right: 0,
+          display: "flex", justifyContent: "center", alignItems: "center",
+        }
+      : {
+          position: "absolute",
+          bottom: 350, left: 0, right: 0,
+          height: 150,
+          display: "flex", justifyContent: "center", alignItems: "flex-end",
+        };
 
   return (
-    <AbsoluteFill style={containerStyle}>
+    <div style={containerStyle}>
       <div
         style={{
           fontSize,
@@ -84,6 +90,6 @@ export const Page: React.FC<{
           );
         })}
       </div>
-    </AbsoluteFill>
+    </div>
   );
 };
